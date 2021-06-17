@@ -10,12 +10,14 @@ import configparser
 import time
 import threading
 import traceback
+import webbrowser
+import os
 
 # TODO: dry-run support to ensure flashing doesn't crash
 
 RESPONSE_LEN = 64
 MAX_FIRMWARE_SN32F260 = 30 * 1024  # 30K
-MAX_FIRMWARE_SN32F240 = 64 * 1024  # 64K
+MAX_FIRMWARE_SN32F240 = 64 * 1024  # 64K Also 240B
 MAX_FIRMWARE = MAX_FIRMWARE_SN32F260
 QMK_OFFSET_DEFAULT = 0x200
 
@@ -29,15 +31,21 @@ EXPECTED_STATUS = 0xFAFAFAFA
 
 DEVICE_DESC = {
     # keyboards in bootloader mode:
-    (0x0c45, 0x7010): "SN32F268F (bootloader)",
-    (0x0c45, 0x7040): "SN32F248B (bootloader)",
-    
+    (0x0c45, 0x7010): "SN32F268F (bootloader)",  # 0x200
+    (0x0c45, 0x7040): "SN32F248B (bootloader)",  # 0x0
+    (0x0c45, 0x7900): "SN32F248 (bootloader)",   # 0x0
+
     # keyboards in normal mode:
-    (0x05ac, 0x024f): "Keychron K4",
+    (0x05ac, 0x024f): "Keychron",
     (0x0c45, 0x652f): "Glorious GMMK / Tecware Phantom",
-    (0x0c45, 0x766b): "Kemove DK63",
-    (0x0c45, 0x7698): "Womier K66",
-    (0x320F, 0x5013): "Akko 3084 Bt5.0",
+    (0x0c45, 0x766b): "Kemove",
+    (0x0c45, 0x7698): "Womier",
+    (0x320F, 0x5013): "Akko",
+    (0x0c45, 0x5004): "Redragon",
+    (0x0c45, 0x5104): "Redragon",
+    (0x0C45, 0x8513): "Sharkoon",
+    (0x0C45, 0x8508): "SPCGear",
+    (0x0C45, 0x7903): "Ajazz",
 }
 
 
@@ -67,12 +75,13 @@ def console_error(msg):
     print("Error: {}".format(msg))
 
 
-def cmd_flash(dev, offset, firmware, progress_cb=console_progress, complete_cb=console_complete, error_cb=console_error):
+def cmd_flash(dev, offset, firmware, progress_cb=console_progress, complete_cb=console_complete, error_cb=console_error, skip_size_check=False):
     while len(firmware) % 64 != 0:
         firmware += b"\x00"
 
-    if len(firmware) + offset > MAX_FIRMWARE:
-        return error_cb("Firmware is too large to flash")
+    if(skip_size_check == False):
+        if len(firmware) + offset > MAX_FIRMWARE:
+            return error_cb("Firmware is too large to flash")
 
     # 1) Initialize
     progress_cb("Initializing device", 0)
@@ -120,19 +129,21 @@ def cmd_reboot(dev, progress_cb=console_progress, complete_cb=console_complete, 
     complete_cb()
 
 
+
 class MainWindow(QWidget):
 
     progress_signal = pyqtSignal(object)
     complete_signal = pyqtSignal(object)
     error_signal = pyqtSignal(object)
 
+
     def __init__(self):
         super().__init__()
 
         self.dev = None
 
+
         self.device_descs = DEVICE_DESC.copy()
-        self.load_devices_ini()
 
         self.qmk_offset = QMK_OFFSET_DEFAULT
 
@@ -145,15 +156,15 @@ class MainWindow(QWidget):
         lbl_warning.setWordWrap(True)
 
         layout_offset = QHBoxLayout()
-        rbtn_qmk_offset_200 = QRadioButton("0x200")
-        rbtn_qmk_offset_200.setChecked(True)
-        rbtn_qmk_offset_200.toggled.connect(
-            lambda: self.on_toggle_offset(rbtn_qmk_offset_200))
-        rbtn_qmk_offset_0 = QRadioButton("0x00")
-        rbtn_qmk_offset_0.toggled.connect(
-            lambda: self.on_toggle_offset(rbtn_qmk_offset_0))
-        layout_offset.addWidget(rbtn_qmk_offset_200)
-        layout_offset.addWidget(rbtn_qmk_offset_0)
+        self.rbtn_qmk_offset_200 = QRadioButton("0x200")
+        self.rbtn_qmk_offset_200.setChecked(True)
+        self.rbtn_qmk_offset_200.toggled.connect(
+            lambda: self.on_toggle_offset(self.rbtn_qmk_offset_200))
+        self.rbtn_qmk_offset_0 = QRadioButton("0x00")
+        self.rbtn_qmk_offset_0.toggled.connect(
+            lambda: self.on_toggle_offset(self.rbtn_qmk_offset_0))
+        layout_offset.addWidget(self.rbtn_qmk_offset_200)
+        layout_offset.addWidget(self.rbtn_qmk_offset_0)
         group_qmk_offset = QGroupBox("qmk offset")
         group_qmk_offset.setLayout(layout_offset)
 
@@ -170,21 +181,26 @@ class MainWindow(QWidget):
         btn_flash_jumploader.clicked.connect(self.on_click_flash_jumploader)
         btn_restore_stock = QPushButton("Revert to Stock Firmware")
         btn_restore_stock.clicked.connect(self.on_click_revert)
+        btn_download_stock_fw = QPushButton("Download Stock Firmware")
+        btn_download_stock_fw.clicked.connect(self.on_download_click)
+        if os.geteuid() == 0:
+            btn_download_stock_fw.setEnabled(False)
+
 
         self.progress = QProgressBar()
         self.progress.setRange(0, 100)
         self.progress_label = QLabel("Ready")
 
         layout_device_type = QHBoxLayout()
-        rbtn_device_type_240 = QRadioButton("SN32F24x")
-        rbtn_device_type_240.toggled.connect(
-            lambda: self.on_toggle_device_type(rbtn_device_type_240))
-        rbtn_device_type_260 = QRadioButton("SN32F26x")
-        rbtn_device_type_260.setChecked(True)
-        rbtn_device_type_260.toggled.connect(
-            lambda: self.on_toggle_device_type(rbtn_device_type_260))
-        layout_device_type.addWidget(rbtn_device_type_260)
-        layout_device_type.addWidget(rbtn_device_type_240)
+        self.rbtn_device_type_240 = QRadioButton("SN32F24x")
+        self.rbtn_device_type_240.toggled.connect(
+            lambda: self.on_toggle_device_type(self.rbtn_device_type_240))
+        self.rbtn_device_type_260 = QRadioButton("SN32F26x")
+        self.rbtn_device_type_260.setChecked(True)
+        self.rbtn_device_type_260.toggled.connect(
+            lambda: self.on_toggle_device_type(self.rbtn_device_type_260))
+        layout_device_type.addWidget(self.rbtn_device_type_260)
+        layout_device_type.addWidget(self.rbtn_device_type_240)
 
         self.combobox_devices = QComboBox()
         btn_refresh_devices = QToolButton()
@@ -215,6 +231,7 @@ class MainWindow(QWidget):
         layout_stock.addWidget(btn_reboot_bl)
         layout_stock.addWidget(btn_flash_jumploader)
         layout_stock.addWidget(btn_restore_stock)
+        layout_stock.addWidget(btn_download_stock_fw)
 
         layout_progress = QVBoxLayout()
         layout_progress.addWidget(self.progress_label)
@@ -243,15 +260,6 @@ class MainWindow(QWidget):
                          self.combobox_devices, btn_refresh_devices]
 
         self.on_click_refresh()
-
-    def load_devices_ini(self):
-        cf = configparser.ConfigParser()
-        cf.read(appctxt.get_resource("devices.ini"))
-        for sec in cf.sections():
-            # print(cf.options(sec))
-            vid = int(cf.get(sec, 'vid'), 16)
-            pid = int(cf.get(sec, 'pid'), 16)
-            self.device_descs.update({(vid, pid): sec})
 
     def lock_user(self):
         for obj in self.lockable:
@@ -318,6 +326,20 @@ class MainWindow(QWidget):
                 self.combobox_devices.addItem("{} [{:04X}:{:04X}]  {} {} ".format(
                     self.device_descs[(vid, pid)], vid, pid, dev["manufacturer_string"], dev["product_string"]))
                 self.devices.append(dev)
+
+                if pid == 0x7040 or pid == 0x7900:  # Sonix 248 and 248B
+                    self.qmk_offset = "0x00"
+                    self.rbtn_qmk_offset_0.setChecked(True)
+                    self.rbtn_qmk_offset_200.setChecked(False)
+                    self.rbtn_device_type_260.setChecked(False)
+                    self.rbtn_device_type_240.setChecked(True)
+
+                if pid == 0x7010:  # Sonix 260
+                    self.qmk_offset = "0x200"
+                    self.rbtn_qmk_offset_200.setChecked(True)
+                    self.rbtn_qmk_offset_0.setChecked(False)
+                    self.rbtn_device_type_240.setChecked(False)
+                    self.rbtn_device_type_260.setChecked(True)
 
     def get_active_device(self):
         idx = self.combobox_devices.currentIndex()
@@ -394,8 +416,8 @@ class MainWindow(QWidget):
         threading.Thread(target=lambda: cmd_reboot(
             self.dev, self.on_progress, self.on_complete, self.on_error)).start()
 
-    def dangerous_flash(self, path):
-        reply = QMessageBox.question(self, "Warning", "This is a potentially dangerous operation, are you sure you want to continue?",
+    def on_click_revert(self):
+        reply = QMessageBox.question(self, "Warning", "This is a potentially dangerous operation. It does not check if your firmware is valid. Are you sure you want to continue?",
                                      QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
         if reply != QMessageBox.Yes:
             return
@@ -404,15 +426,21 @@ class MainWindow(QWidget):
         if not self.dev:
             return
 
-        with open(path, "rb") as inf:
+        options = QFileDialog.Options()
+        options |= QFileDialog.DontUseNativeDialog
+        filename = QFileDialog.getOpenFileName(
+            None, "Select stock firmware to flash", "", "Stock Firmware (*.bin)", options=options)[0]
+        if not filename:
+            self.close_dev()
+            return
+
+        with open(filename, "rb") as inf:
             firmware = inf.read()
 
         self.lock_user()
         threading.Thread(target=lambda: cmd_flash(
-            self.dev, 0, firmware, self.on_progress, self.on_complete, self.on_error)).start()
+            self.dev, 0, firmware, self.on_progress, self.on_complete, self.on_error, True)).start()
 
-    def on_click_revert(self):
-        self.dangerous_flash(appctxt.get_resource("stock-firmware.bin"))
 
     def on_click_flash_jumploader(self):
         reply = QMessageBox.question(self, "Warning", "This is a potentially dangerous operation, are you sure you want to continue?",
@@ -446,6 +474,9 @@ class MainWindow(QWidget):
         threading.Thread(target=lambda: cmd_flash(
             self.dev, 0, firmware, self.on_progress, self.on_complete, self.on_error)).start()
 
+    def on_download_click(self):
+    	webbrowser.open("https://github.com/SonixQMK/Mechanical-Keyboard-Database", new=1, autoraise=True)
+
 
 def excepthook(exc_type, exc_value, exc_tb):
     exc = traceback.format_exception(exc_type, exc_value, exc_tb)
@@ -457,7 +488,11 @@ if __name__ == '__main__':
     appctxt = ApplicationContext()
     window = MainWindow()
     window.resize(600, 500)
-    window.setWindowTitle("Sonix Keyboard Flasher")
+    if os.geteuid() == 0:
+        window.setWindowTitle("Sonix Keyboard Flasher (ROOT)")
+    else:
+        window.setWindowTitle("Sonix Keyboard Flasher")
+
     window.show()
     sys.excepthook = excepthook
     exit_code = appctxt.app.exec_()
